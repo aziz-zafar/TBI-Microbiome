@@ -1,0 +1,838 @@
+---
+title: "TBI"
+author: "Aziz Ur Rehman Zafar"
+date: "4/26/2023"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+Run this setup chunk below before starting work.
+```{r}
+library(ggplot2)
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(lmerTest)
+library(lme4)
+library(glmmLasso)
+library(miceRanger)
+library(rstudioapi)
+library(car)
+library(ez)
+library(purrr)
+library(rcompanion)
+library(DescTools)
+library(igraph)
+```
+
+Run this code after combining diversity, master data, and fecal sample data from Python.
+```{r, Data Processing}
+# Getting the path of your current open file
+current_path = rstudioapi::getActiveDocumentContext()$path 
+setwd(dirname(current_path ))
+
+diversity_master = read.csv("../diversity_master.tsv", sep = "\t",colClasses = c(Sample_ID= "character"))
+#colnames(diversity_master)[1] = "Sample_ID" 
+diversity_master = diversity_master %>% drop_na("BC_Dissimilarity")
+
+# categorical_vars_2 = c("Bristol.Stool.Scale", "Caffeine",
+#                      "NSAIDS","Nicotine.Products", "Orthopedic.Injury", "Pre.Workout",
+#                      "Self.Reported.Illness","Vomited")
+#diversity_master[,categorical_vars_2][diversity_master[,categorical_vars_2] ==0]=NA
+categorical_vars = c("Bristol.Stool.Scale", "Caffeine", "Change.of.Living.or.DIning.Circumstance",
+                     "NSAIDS","Nicotine.Products", "Orthopedic.Injury", "Pre.Workout",
+                     "Self.Reported.Illness","Vomited")
+diversity_master[categorical_vars] <- lapply(diversity_master[categorical_vars] , factor)
+
+diversity_master_SWAY = diversity_master
+diversity_master = diversity_master %>% select(-c(Anxiety.Symptoms, Depression.Symptoms,
+                                                  ImpulseControl..ms., InspectionTime..ms.,
+                                                  Reaction.time..ms.,Somatization.Symptoms,
+                                                  Working.memory,
+                                                  mBESS..Balance.Error.Scoring.System.,
+                                                  ))
+diversity_master$Non.specific.impact.load....Team.Average.for.participants.8.and.16.[
+  is.na(diversity_master$Non.specific.impact.load....Team.Average.for.participants.8.and.16.)]=0
+diversity_master$Total.Player.Load..Team.Average.for.8.and.16....effort.metric[
+  is.na(diversity_master$Total.Player.Load..Team.Average.for.8.and.16....effort.metric)]=0
+diversity_master$Pre.Workout[diversity_master$Pre.Workout == 0]=NA
+diversity_master_imputed = miceRanger(diversity_master, m =1)
+diversity_master_imputed = completeData(diversity_master_imputed)
+diversity_master_imputed = diversity_master_imputed$Dataset_1
+
+#Removing player 9 data for antibiotics
+diversity_master_imputed_no_9 = diversity_master_imputed[-c(201:213),]
+diversity_master_imputed_no_9 = diversity_master_imputed_no_9 %>% slice(1:(n() - 4))%>%
+  mutate(Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average. =
+           as.numeric(Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average.))
+
+
+diversity_master_imputed_no_9 = diversity_master_imputed_no_9 %>% group_by(Player) %>%
+  mutate(First_Hour = as.numeric(first(Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average.))) %>% 
+  mutate(Hours_calculated= as.numeric((Days*24) + First_Hour)) %>%
+  mutate(Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average. = coalesce(Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average., Hours_calculated)) %>%
+  select(-c(Hours_calculated, First_Hour))
+
+write.table(diversity_master_imputed_no_9, "../diversity_master_without_9.tsv", sep = "\t", row.names = F)
+
+```
+
+
+```{r}
+
+
+# Get counts for each separate category in categorical columns
+numeric_summary <- diversity_master_imputed_no_9 %>%
+  ungroup() %>%
+  summarise(across(where(is.numeric), list(mean = ~mean(.), std_error = ~sd(.)/sqrt(n()))))
+
+categorical_summary <- diversity_master_imputed_no_9 %>%
+  ungroup() %>%
+  select(where(is.factor))%>%
+  map(~ table(.x) ) %>%
+  bind_rows(.id = "Factor_Column")
+
+# Combine numeric and categorical summaries
+
+# Print the summary
+#print(summary_result)
+
+# Export the summary to a CSV file
+write.csv(numeric_summary, file = "summary_result_numeric.csv", row.names = FALSE)
+write.csv(categorical_summary, file = "categorical_summary.csv", row.names = FALSE)
+
+```
+
+```{r}
+BC_pmp = read.csv("BC_Dissimilaritypre_mid_post.tsv", sep = "\t")
+faith_pmp = read.csv("faith_pdpre_mid_post.tsv", sep = "\t")
+
+result <- summarise_all(BC_pmp, list(median = ~ median(.), iqr = ~ IQR(.)))
+print(result)
+
+
+
+result <- summarise_all(faith_pmp, list(median = ~ median(.), iqr = ~ IQR(.)))
+print(result)
+
+BC_slices = read.csv("BC_Dissimilarityslices.tsv", sep = "\t")
+faith_slices = read.csv("faith_pdslices.tsv", sep = "\t")
+
+result <- summarise_all(BC_slices, list(median = ~ median(.), iqr = ~ IQR(.)))
+print(result)
+
+result <- summarise_all(faith_slices, list(median = ~ median(.), iqr = ~ IQR(.)))
+print(result)
+
+```
+Diversity Linear Models
+```{r}
+options(scipen=999)
+
+lm1 = lmer(BC_Dissimilarity ~ Impact.load.sustained.0.24.hours.prior*Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average.+Alcohol+relevel(Bristol.Stool.Scale, ref = "4")+
+             Caffeine + Change.of.Living.or.DIning.Circumstance +
+             Diet.Sodas + Hours.of.Sleep + NSAIDS + Nicotine.Products + 
+             Orthopedic.Injury+ Pre.Workout + Self.Reported.Illness + 
+             Sleep.Quality + Stress.Rating + Symptom.Score + Vomited+Total.Player.Load..Team.Average.for.8.and.16....effort.metric+
+             
+             (1|Player), data = diversity_master_imputed_no_9)
+vif(lm1)
+plot(resid(lm1))
+hist(resid(lm1))
+sink(file = paste("../Diversity Models/", "BC_model_24.txt", sep = ""))
+print(summary(lm1))
+sink()
+
+Variable_Name = rownames(summary(lm1)$coefficients)
+df1 = data.frame(Variable_Name)
+df1 <- cbind(df1, coef(summary(lm1)))
+df1 <- cbind(df1, P_Value = summary(lm1)$coefficients[,5])
+adjusted2 <- p.adjust(as.numeric(unlist(dplyr::select(df1, P_Value))), method="BH")
+df1 <- df1 %>% add_column(Adjusted_P = adjusted2)
+write.csv(df1, file = paste("../Diversity Models/", "BC_model_24.csv", sep = ""), row.names = FALSE)
+
+
+
+lm2 = lmer(faith_pd ~ Impact.load.sustained.0.24.hours.prior*Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average.+Alcohol+relevel(Bristol.Stool.Scale, ref = "4")+
+             Caffeine + Change.of.Living.or.DIning.Circumstance +
+             Diet.Sodas + Hours.of.Sleep + NSAIDS+Nicotine.Products + 
+             Orthopedic.Injury+ Pre.Workout + Self.Reported.Illness + 
+             Sleep.Quality + Stress.Rating + Symptom.Score + Vomited+Total.Player.Load..Team.Average.for.8.and.16....effort.metric+
+             (1|Player), data = diversity_master_imputed_no_9)
+vif(lm2)
+plot(resid(lm2))
+hist(resid(lm2))
+sink(file = paste("../Diversity Models/", "faith_model_24.txt", sep = ""))
+print(summary(lm2))
+sink()
+Variable_Name = rownames(summary(lm2)$coefficients)
+df1 = data.frame(Variable_Name)
+df1 <- cbind(df1, coef(summary(lm2)))
+df1 <- cbind(df1, P_Value = summary(lm2)$coefficients[,5])
+adjusted2 <- p.adjust(as.numeric(unlist(dplyr::select(df1, P_Value))), method="BH")
+df1 <- df1 %>% add_column(Adjusted_P = adjusted2)
+write.csv(df1, file = paste("../Diversity Models/", "faith_model_24.csv", sep = ""), row.names = FALSE)
+
+
+lm3 = lmer(simpson ~ Impact.load.sustained.0.24.hours.prior*Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average.+Alcohol+relevel(Bristol.Stool.Scale, ref = "4")+
+             Caffeine + Change.of.Living.or.DIning.Circumstance +
+             Diet.Sodas + Hours.of.Sleep + NSAIDS+Nicotine.Products + 
+             Orthopedic.Injury+ Pre.Workout + Self.Reported.Illness + 
+             Sleep.Quality + Stress.Rating + Symptom.Score + Vomited+Total.Player.Load..Team.Average.for.8.and.16....effort.metric+
+             
+             (1|Player), data = diversity_master_imputed_no_9)
+vif(lm3)
+plot(resid(lm3))
+hist(resid(lm3))
+sink(file = paste("../Diversity Models/", "simpson_model_24.txt", sep = ""))
+print(summary(lm3))
+sink()
+Variable_Name = rownames(summary(lm3)$coefficients)
+df1 = data.frame(Variable_Name)
+df1 <- cbind(df1, coef(summary(lm3)))
+df1 <- cbind(df1, P_Value = summary(lm3)$coefficients[,5])
+adjusted2 <- p.adjust(as.numeric(unlist(dplyr::select(df1, P_Value))), method="BH")
+df1 <- df1 %>% add_column(Adjusted_P = adjusted2)
+write.csv(df1, file = paste("../Diversity Models/", "simpson_model_24.csv", sep = ""), row.names = FALSE)
+
+
+
+lm4 = lmer(UniFrac_Distance ~ Impact.load.sustained.0.24.hours.prior*Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average.+Alcohol+relevel(Bristol.Stool.Scale, ref = "4")+
+             Caffeine + Change.of.Living.or.DIning.Circumstance +
+             Diet.Sodas + Hours.of.Sleep + NSAIDS+Nicotine.Products + 
+             Orthopedic.Injury+ Pre.Workout + Self.Reported.Illness + 
+             Sleep.Quality + Stress.Rating + Symptom.Score + Vomited+Total.Player.Load..Team.Average.for.8.and.16....effort.metric+
+             
+             (1|Player), data = diversity_master_imputed_no_9)
+vif(lm4)
+plot(resid(lm4))
+hist(resid(lm4))
+sink(file = paste("../Diversity Models/", "unifrac_model_24.txt", sep = ""))
+print(summary(lm4))
+sink()
+Variable_Name = rownames(summary(lm4)$coefficients)
+df1 = data.frame(Variable_Name)
+df1 <- cbind(df1, coef(summary(lm4)))
+df1 <- cbind(df1, P_Value = summary(lm4)$coefficients[,5])
+adjusted2 <- p.adjust(as.numeric(unlist(dplyr::select(df1, P_Value))), method="BH")
+df1 <- df1 %>% add_column(Adjusted_P = adjusted2)
+write.csv(df1, file = paste("../Diversity Models/", "unifrac_model_24.csv", sep = ""), row.names = FALSE)
+
+
+```
+Switch back to Python before coming here!
+
+Combining taxonomic abundance data with survey data
+```{r}
+species_processed = read.csv("../species_processed.tsv", sep = "\t")
+species_master_no_9 = merge(species_processed, diversity_master_imputed_no_9, by = "Sample_ID")
+write.table(species_master_no_9, "../species_master_without_9.tsv", sep = "\t", row.names = F)
+
+genus_processed = read.csv("../genus_processed.tsv", sep = "\t")
+genus_master_no_9 = merge(genus_processed, diversity_master_imputed_no_9, by = "Sample_ID")
+write.table(genus_master_no_9, "../genus_master_without_9.tsv", sep = "\t", row.names = F)
+
+family_processed = read.csv("../family_processed.tsv", sep = "\t")
+family_master_no_9 = merge(family_processed, diversity_master_imputed_no_9, by = "Sample_ID")
+write.table(family_master_no_9, "../family_master_without_9.tsv", sep = "\t", row.names = F)
+
+order_processed =read.csv("../order_processed.tsv", sep = "\t")
+#order_processed = na.omit(order_processed)
+order_master_no_9 = merge(order_processed,diversity_master_imputed_no_9, by= "Sample_ID")
+write.table(order_master_no_9, "../order_master_without_9.tsv", sep = "\t", row.names = F)
+
+phyla_processed = read.csv("../phyla_processed.tsv", sep = "\t")
+phyla_master_no_9 = merge(phyla_processed, diversity_master_imputed_no_9, by = "Sample_ID")
+write.table(phyla_master_no_9, "../phyla_master_without_9.tsv", sep = "\t", row.names = F)
+
+phyla_processed = read.csv("../phyla_processed_with_control.tsv", sep = "\t")
+phyla_master_no_9_control = merge(phyla_processed, diversity_master_imputed_no_9, by = "Sample_ID")
+phyla_master_no_9_control = subset(phyla_master_no_9_control,select =  colnames(phyla_processed))
+phyla_master_no_9_control = rbind(phyla_master_no_9_control, phyla_processed[c(247:251),])
+write.table(phyla_master_no_9_control, "../phyla_master_without_9_with_control.tsv", sep = "\t", row.names = F)
+```
+
+
+```{r}
+
+weekly_analysis = function(df, metric = "faith_pd"){
+
+  week_vector = seq(7, 35, by =7)
+  
+  subset_df = df
+  subset_df = subset_df %>% mutate(Week = case_when(
+                             Days == 0 ~ 0,
+                             Days <= week_vector[1] ~ 1,
+                             Days <= week_vector[2] ~ 2,
+                             Days <= week_vector[3] ~ 3,
+                             Days <= week_vector[4] ~ 4,
+                             Days <= week_vector[5] ~ 5,
+                             TRUE ~ 6))
+  subset_df = subset_df %>% subset(Week <6 & Week >0)
+  subset_df$Week = as.factor(subset_df$Week)
+  subset_df = subset_df %>% group_by(Week,Player)%>%slice_tail(n=3)
+  print(subset_df)
+
+  aov_input = parse(text = paste("ezANOVA(subset_df, dv =",
+                                 as.symbol(metric), ", within = .(Week),wid =  .(Player), type = 3)", sep = ""))
+  aov = eval(aov_input)
+  print(aov)
+  
+  
+  gp = ggplot(data = subset_df, aes(x = as.factor(Week), y = BC_Dissimilarity)) + geom_boxplot()
+  gp
+  
+}
+
+weekly_analysis(diversity_master_imputed_no_9, metric = "BC_Dissimilarity")
+
+ggplot(data = diversity_master_imputed_no_9, aes(x=IMPACT.LOAD.2.24.HOURS.BEFORE.FECAL.SAMPLE, y = BC_Dissimilarity,
+                                                 color=as.factor(Player))) +
+  geom_point() + geom_quantile(quantiles = 0.5)
+
+```
+Making models for each taxa level
+```{r, results='hide'}
+
+taxa_model = function(df, taxa){
+
+  lm_formula = as.formula( paste(taxa, " ~ Impact.load.sustained.48.72.hours.priot*Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average.+Alcohol+relevel(Bristol.Stool.Scale, ref = \"4\")+
+             Caffeine + Change.of.Living.or.DIning.Circumstance +
+             Diet.Sodas + Hours.of.Sleep + NSAIDS+Nicotine.Products + 
+             Orthopedic.Injury+ Pre.Workout + Self.Reported.Illness + 
+             Sleep.Quality + Stress.Rating + Symptom.Score + Vomited+Total.Player.Load..Team.Average.for.8.and.16....effort.metric+
+             (1|Player)", sep ="") )
+  lm1 = lmer(formula = lm_formula, data = df)
+  vif(lm1)
+  plot(resid(lm1))
+  hist(resid(lm1))
+  sink(file = paste("../Taxa Models 72/",taxa, "_model.txt", sep = ""))
+
+  print(summary(lm1))
+  sink()
+  
+  
+  Variable_Name = rownames(summary(lm1)$coefficients)
+  df1 = data.frame(Variable_Name)
+  df1 <- cbind(df1, coef(summary(lm1)))
+  df1 <- cbind(df1, P_Value = summary(lm1)$coefficients[,5])
+  adjusted2 <- p.adjust(as.numeric(unlist(dplyr::select(df1, P_Value))), method="BH")
+  df1 <- df1 %>% add_column(Adjusted_P = adjusted2)
+  write.csv(df1, file = paste("../Taxa Models 72/",taxa, "_model.csv", sep = ""), row.names = FALSE)
+
+}
+taxa_model(df=order_master_no_9, "Bacteroidales")
+taxa_model(df=order_master_no_9, "Coriobacteriales")
+taxa_model(df=order_master_no_9, "Lachnospirales")
+#taxa_model(df=order_master_no_9, "Oscillospirales")
+
+taxa_model(df=order_master_no_9, "Bifidobacteriales")
+taxa_model(df=order_master_no_9, "Lactobacillales")
+taxa_model(df=order_master_no_9, "Burkholderiales")
+taxa_model(df=order_master_no_9, "Enterobacterales")
+#taxa_model(df=order_master_no_9, "Pseudomonadales")
+taxa_model(df=order_master_no_9, "Campylobacterales")
+taxa_model(df=order_master_no_9, "Clostridiales")
+taxa_model(df=order_master_no_9, "Verrucomicrobiales")
+
+
+#taxa_model(df=family_master_no_9, "Micrococcaceae")
+taxa_model(df=family_master_no_9, "Prevotellaceae")
+taxa_model(df=family_master_no_9, "Leuconostocaceae")
+taxa_model(df=family_master_no_9, "Streptococcaceae")
+taxa_model(df=family_master_no_9, "Peptococcaceae")
+taxa_model(df=family_master_no_9, "Lachnospiraceae")
+taxa_model(df=family_master_no_9, "Bacteroidaceae")
+taxa_model(df=family_master_no_9, "Rikenellaceae")
+taxa_model(df=family_master_no_9, "Ruminococcaceae")
+taxa_model(df=family_master_no_9, "Clostridiaceae")
+taxa_model(df=family_master_no_9, "Bifidobacteriaceae")
+
+taxa_model(df=genus_master_no_9, "Prevotella")
+taxa_model(df=genus_master_no_9, "Weissella")
+taxa_model(df=genus_master_no_9, "Lactococcus")
+taxa_model(df=genus_master_no_9, "Anaerostipes")
+taxa_model(df=genus_master_no_9, "Lactobacillus")
+taxa_model(df=genus_master_no_9, "Ruminococcus")
+taxa_model(df=genus_master_no_9, "Bifidobacterium")
+taxa_model(df=genus_master_no_9, "Bacteroides")
+
+taxa_model(df=species_master_no_9, "Anaerostipes_hadrus")
+
+
+
+```
+Dissecting Interaction Terms.
+```{r}
+johnson_neyman(lmer(Prevotella ~ Impact.load.sustained.48.72.hours.priot*Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average.+Alcohol+relevel(Bristol.Stool.Scale, ref = 4)+
+             Caffeine + Change.of.Living.or.DIning.Circumstance +
+             Diet.Sodas + Hours.of.Sleep + NSAIDS+Nicotine.Products + 
+             Orthopedic.Injury+ Pre.Workout + Self.Reported.Illness + 
+             Sleep.Quality + Stress.Rating + Symptom.Score + Vomited+Total.Player.Load..Team.Average.for.8.and.16....effort.metric+
+             (1|Player), data = genus_master_no_9), pred = Impact.load.sustained.48.72.hours.priot, modx = Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average., alpha = .05)
+
+
+johnson_neyman(lmer(Coriobacteriales ~ Impact.load.sustained.48.72.hours.priot*Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average.+Alcohol+relevel(Bristol.Stool.Scale, ref = 4)+
+             Caffeine + Change.of.Living.or.DIning.Circumstance +
+             Diet.Sodas + Hours.of.Sleep + NSAIDS+Nicotine.Products + 
+             Orthopedic.Injury+ Pre.Workout + Self.Reported.Illness + 
+             Sleep.Quality + Stress.Rating + Symptom.Score + Vomited+Total.Player.Load..Team.Average.for.8.and.16....effort.metric+
+             (1|Player), data = order_master_no_9), pred = Impact.load.sustained.48.72.hours.priot, modx = Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average., alpha = .05)
+
+johnson_neyman(lmer(Ruminococcus ~ Impact.load.sustained.48.72.hours.priot*Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average.+Alcohol+relevel(Bristol.Stool.Scale, ref = 4)+
+             Caffeine + Change.of.Living.or.DIning.Circumstance +
+             Diet.Sodas + Hours.of.Sleep + NSAIDS+Nicotine.Products + 
+             Orthopedic.Injury+ Pre.Workout + Self.Reported.Illness + 
+             Sleep.Quality + Stress.Rating + Symptom.Score + Vomited+Total.Player.Load..Team.Average.for.8.and.16....effort.metric+
+             (1|Player), data = genus_master_no_9), pred = Impact.load.sustained.48.72.hours.priot, modx = Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average., alpha = .05)
+
+johnson_neyman(lmer(Prevotellaceae ~ Impact.load.sustained.48.72.hours.priot*Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average.+Alcohol+relevel(Bristol.Stool.Scale, ref = 4)+
+             Caffeine + Change.of.Living.or.DIning.Circumstance +
+             Diet.Sodas + Hours.of.Sleep + NSAIDS+Nicotine.Products + 
+             Orthopedic.Injury+ Pre.Workout + Self.Reported.Illness + 
+             Sleep.Quality + Stress.Rating + Symptom.Score + Vomited+Total.Player.Load..Team.Average.for.8.and.16....effort.metric+
+             (1|Player), data = family_master_no_9), pred = Impact.load.sustained.48.72.hours.priot, modx = Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average., alpha = .05)
+
+johnson_neyman(lmer(Verrucomicrobiales ~ Impact.load.sustained.48.72.hours.priot*Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average.+Alcohol+relevel(Bristol.Stool.Scale, ref = 4)+
+             Caffeine + Change.of.Living.or.DIning.Circumstance +
+             Diet.Sodas + Hours.of.Sleep + NSAIDS+Nicotine.Products + 
+             Orthopedic.Injury+ Pre.Workout + Self.Reported.Illness + 
+             Sleep.Quality + Stress.Rating + Symptom.Score + Vomited+Total.Player.Load..Team.Average.for.8.and.16....effort.metric+
+             (1|Player), data = order_master_no_9), pred = Impact.load.sustained.48.72.hours.priot, modx = Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average., alpha = .1)
+
+johnson_neyman(lmer(Weissella ~ Impact.load.sustained.24.48.hours.prior*Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average.+Alcohol+relevel(Bristol.Stool.Scale, ref = 4)+
+             Caffeine + Change.of.Living.or.DIning.Circumstance +
+             Diet.Sodas + Hours.of.Sleep + NSAIDS+Nicotine.Products + 
+             Orthopedic.Injury+ Pre.Workout + Self.Reported.Illness + 
+             Sleep.Quality + Stress.Rating + Symptom.Score + Vomited+Total.Player.Load..Team.Average.for.8.and.16....effort.metric+
+             (1|Player), data = genus_master_no_9), pred = Impact.load.sustained.24.48.hours.prior, modx = Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average., alpha = .1)
+```
+
+Network Analysis (Preliminary)
+
+```{r}
+orders = colnames(order_processed)[-1]
+threshold = quantile(order_master_no_9$Impact.load.sustained.0.24.hours.prior, 0.75)  
+
+high_impact = order_master_no_9[order_master_no_9$Impact.load.sustained.0.24.hours.prior>threshold,]
+low_impact_24 = order_master_no_9[order_master_no_9$Impact.load.sustained.0.24.hours.prior<=threshold,]
+low_impact_48 = order_master_no_9[order_master_no_9$Impact.load.sustained.24.48.hours.prior<=threshold,]
+low_impact_72 = order_master_no_9[order_master_no_9$Impact.load.sustained.48.72.hours.priot<=threshold,]
+
+high_impact = high_impact %>% select(-Sample_ID)
+low_impact = low_impact %>% select(-Sample_ID)
+high_cor = cor(high_impact[, orders])
+diag(high_cor) = 0
+high_cor = high_cor[-c(2,6,11,15,30),-c(2,6,11,15,30)]
+
+colMax <- function(data) apply(data, 2, max)
+cutoff = 0.5
+to.remove = (colMax(abs(high_cor)) <= cutoff)
+high_cor = high_cor[!(to.remove), !(to.remove)]
+high_cor[abs(high_cor) <0.5] = 0
+
+high_graph = graph_from_adjacency_matrix(high_cor, mode = "upper", weighted=T)
+color_vector = ifelse(E(high_graph)$weight > 0,'green','red')
+coords = layout_(high_graph, as_star())
+
+#plot(high_graph, layout=coords, edge.width=exp(abs(E(high_graph)$weight * 2) ),
+#     edge.color = color_vector)
+
+#########
+
+
+
+
+#######
+
+all_cor = cor(order_master_no_9[, orders])
+diag(all_cor) = 0
+all_cor = all_cor[-c(2,6,11,15,30),-c(2,6,11,15,30)]
+
+colMax <- function(data) apply(data, 2, max)
+cutoff = 0.5
+to.remove = (colMax(abs(all_cor)) <= cutoff)
+all_cor = all_cor[!(to.remove), !(to.remove)]
+all_cor[abs(all_cor) <0.5] = 0
+
+all_graph = graph_from_adjacency_matrix(all_cor, mode = "upper", weighted=T)
+color_vector_all = ifelse(E(all_graph)$weight > 0,'green','red')
+coords_all = layout_(all_graph, as_star())
+
+
+low_cor = cor(low_impact[, orders])
+diag(low_cor) = 0
+low_cor = low_cor[-c(2,6,11,15,30),-c(2,6,11,15,30)]
+
+cutoff = 0.5
+to.remove = (colMax(abs(low_cor)) <= cutoff)
+low_cor = low_cor[!(to.remove), !(to.remove)]
+low_cor[abs(low_cor) <0.5] = 0
+
+low_graph = graph_from_adjacency_matrix(low_cor, mode = "upper", weighted=T)
+color_vector_low = ifelse(E(low_graph)$weight > 0,'green','red')
+#coords_low = layout_(low_graph, as_star())
+
+#plot(low_graph, layout=coords_low, edge.width=exp(abs(E(low_graph)$weight * 2) ),
+#     edge.color = color_vector_low)
+
+
+low_names = V(low_graph)$name
+all_names = V(all_graph)$name
+
+coords_low = coords_all[match(low_names,all_names),]
+plot(all_graph, layout=coords_all, edge.width=exp(abs(E(all_graph)$weight * 2) ),
+     edge.color = color_vector_all)
+
+union_graph = union(all_graph,low_graph)
+union_edges = as_edgelist(union_graph)
+union_edge_weights = list()
+union_edge_colors = list()
+union_edge_lty = list()
+
+maxabs = function(v1,v2){
+  if (abs(v1) > abs(v2) ){return(v1)}
+  else if (abs(v2) > abs(v1) ){return(v2)}
+  else{return(v1)}
+}
+
+for (i in 1:nrow(union_edges)) {
+  
+  if (paste0(union_edges[i,1],union_edges[i,2]) %in% do.call(paste0, as.data.frame(as_edgelist(all_graph))) ) {
+    if (paste0(union_edges[i,1],union_edges[i,2]) %in% do.call(paste0, as.data.frame(as_edgelist(low_graph))) ){
+      #present in both
+      union_edge_weights[[i]] = maxabs(E(all_graph)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                        == do.call(paste0, as.data.frame(as_edgelist(all_graph))))],
+                                    E(low_graph)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                        == do.call(paste0, as.data.frame(as_edgelist(low_graph))))] )
+      union_edge_colors[[i]] = case_when(E(all_graph)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                        == do.call(paste0, as.data.frame(as_edgelist(all_graph))))] > 0 &
+                                            E(low_graph)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                        == do.call(paste0, as.data.frame(as_edgelist(low_graph))))] > 0~"green",
+                                          E(all_graph)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                        == do.call(paste0, as.data.frame(as_edgelist(all_graph))))] < 0 &
+                                            E(low_graph)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                        == do.call(paste0, as.data.frame(as_edgelist(low_graph))))] < 0 ~ "red",
+                                          TRUE ~ "yellow")
+      union_edge_lty[[i]] = 1
+    }
+    #present in only all graph
+    else{
+      union_edge_weights[[i]] = E(all_graph)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                        == do.call(paste0, as.data.frame(as_edgelist(all_graph))))]
+      union_edge_colors[[i]] = ifelse(union_edge_weights[[i]]>0, "green", "red")
+      union_edge_lty[[i]] = 5
+    }
+  }
+  #present in only low impact graph
+  else {
+    union_edge_weights[[i]] = E(low_graph)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                        == do.call(paste0, as.data.frame(as_edgelist(low_graph))))]
+    union_edge_colors[[i]] = ifelse(union_edge_weights[[i]]>0, "green", "red")
+
+    union_edge_lty[[i]] = 3
+  }
+}
+vertex_phyla = case_when(V(union_graph)$name == "Actinomycetales" |
+                         V(union_graph)$name == "Bifidobacteriales" |
+                         V(union_graph)$name == "Coriobacteriales"~ "Actionobacteriota",
+                         V(union_graph)$name == "Bacteroidales" ~ "Bacteroidota",
+                         V(union_graph)$name == "Desulfovibrionales" ~ "Desulfobacterota",
+                         V(union_graph)$name == "Verrocomicrobiales" ~ "Verrucomicrobiota",
+                         V(union_graph)$name == "Rhodospirillales" ~ "Proteobacteria",
+                         TRUE ~ "Firmicutes")
+vertex_color = case_when(V(union_graph)$name == "Actinomycetales" |
+                         V(union_graph)$name == "Bifidobacteriales" |
+                         V(union_graph)$name == "Coriobacteriales"~ "red",
+                         V(union_graph)$name == "Bacteroidales" ~ "purple",
+                         V(union_graph)$name == "Desulfovibrionales" ~ "green",
+                         V(union_graph)$name == "Verrocomicrobiales" ~ "blue",
+                         V(union_graph)$name == "Rhodospirillales" ~ "yellow",
+                         TRUE ~ "cyan")
+union_coords = layout_with_kk(union_graph)
+plot(union_graph, layout = union_coords, edge.width = exp(abs(unlist(union_edge_weights))*2),
+     edge.color = unlist(union_edge_colors), edge.lty = unlist(union_edge_lty),
+     vertex.label.dist = case_when(
+           union_coords[,1] <0 ~ -2,
+           union_coords[,1] >0 ~ 2,
+           TRUE ~ 1),
+     vertex.color = vertex_color,
+     vertex.label.degree = case_when(union_coords[,2]<0 & union_coords[,1]<0  ~ -pi/4,
+           union_coords[,2] > 0 & union_coords[,1] > 0 ~ -pi/4,
+           TRUE ~ pi/4 + 0.1))
+     
+```
+
+
+Network Analysis (Final)
+```{r}
+orders = colnames(order_processed)[-1]
+threshold = quantile(order_master_no_9$Impact.load.sustained.0.24.hours.prior, 0.75)  
+
+high_impact = order_master_no_9[order_master_no_9$Impact.load.sustained.0.24.hours.prior>threshold,]
+low_impact_24 = order_master_no_9[order_master_no_9$Impact.load.sustained.0.24.hours.prior<=threshold,]
+low_impact_48 = order_master_no_9[order_master_no_9$Impact.load.sustained.24.48.hours.prior<=threshold,]
+low_impact_72 = order_master_no_9[order_master_no_9$Impact.load.sustained.48.72.hours.priot<=threshold,]
+low_impact_24 = low_impact_24 %>% select(-Sample_ID)
+low_impact_48 = low_impact_48 %>% select(-Sample_ID)
+low_impact_72 = low_impact_72 %>% select(-Sample_ID)
+
+all_cor = cor(order_master_no_9[, orders])
+diag(all_cor) = 0
+all_cor = all_cor[-c(2,11,15),-c(2,11,15)]
+cutoff = 0.5
+colMax <- function(data) apply(data, 2, max)
+
+to.remove = (colMax(abs(all_cor)) <= cutoff)
+all_cor = all_cor[!(to.remove), !(to.remove)]
+all_cor[abs(all_cor) <cutoff] = 0
+
+low_cor_24 = cor(low_impact_24[, orders])
+diag(low_cor_24) = 0
+low_cor_24 = low_cor_24[-c(2,11,15),-c(2,11,15)]
+
+to.remove = (colMax(abs(low_cor_24)) <= cutoff)
+low_cor_24 = low_cor_24[!(to.remove), !(to.remove)]
+low_cor_24[abs(low_cor_24) <cutoff] = 0
+
+low_cor_48 = cor(low_impact_48[, orders])
+diag(low_cor_48) = 0
+low_cor_48 = low_cor_48[-c(2,11,15),-c(2,11,15)]
+
+to.remove = (colMax(abs(low_cor_48)) <= cutoff)
+low_cor_48 = low_cor_48[!(to.remove), !(to.remove)]
+low_cor_48[abs(low_cor_48) <cutoff] = 0
+
+low_cor_72 = cor(low_impact_72[, orders])
+diag(low_cor_72) = 0
+low_cor_72 = low_cor_72[-c(2,11,15),-c(2,11,15)]
+
+to.remove = (colMax(abs(low_cor_72)) <= cutoff)
+low_cor_72 = low_cor_72[!(to.remove), !(to.remove)]
+low_cor_72[abs(low_cor_72) <cutoff] = 0
+
+all_graph = graph_from_adjacency_matrix(all_cor, mode = "upper", weighted=T)
+low_graph_24 = graph_from_adjacency_matrix(low_cor_24, mode = "upper", weighted=T)
+low_graph_48 = graph_from_adjacency_matrix(low_cor_48, mode = "upper", weighted=T)
+low_graph_72 = graph_from_adjacency_matrix(low_cor_72, mode = "upper", weighted=T)
+
+color_vector_all = ifelse(E(all_graph)$weight > 0,'green','red')
+coords_all = layout_(all_graph, as_star())
+
+union_graph = union(all_graph,low_graph_24,low_graph_48,low_graph_72)
+union_edges = as_edgelist(union_graph)
+union_edge_weights = list()
+union_edge_colors = list()
+union_edge_lty = list()
+
+maxabs <- function(x) {
+  if (length(x) == 0) {
+    stop("Input vector is empty.")
+  }
+  
+  max_abs_val <- max(abs(x))
+  max_abs_arg <- which(abs(x) == max_abs_val)[1]
+  
+  return(x[max_abs_arg])
+}
+
+for (i in 1:nrow(union_edges)) {
+  
+  if (paste0(union_edges[i,1],union_edges[i,2]) %in% do.call(paste0, as.data.frame(as_edgelist(all_graph))) ) {
+    if (paste0(union_edges[i,1],union_edges[i,2]) %in% do.call(paste0, as.data.frame(as_edgelist(low_graph_24))) ){
+      if (paste0(union_edges[i,1],union_edges[i,2]) %in% do.call(paste0, as.data.frame(as_edgelist(low_graph_48))) ){
+        if (paste0(union_edges[i,1],union_edges[i,2]) %in% do.call(paste0, as.data.frame(as_edgelist(low_graph_72))) ){
+          #present in both
+          union_edge_weights[[i]] = maxabs(c(E(all_graph)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                            == do.call(paste0, as.data.frame(as_edgelist(all_graph))))],
+                                           E(low_graph_24)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                            == do.call(paste0, as.data.frame(as_edgelist(low_graph_24))))],
+                                           E(low_graph_48)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                            == do.call(paste0, as.data.frame(as_edgelist(low_graph_48))))],
+                                           E(low_graph_72)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                            == do.call(paste0, as.data.frame(as_edgelist(low_graph_72))))] ))
+          union_edge_colors[[i]] = "pink"
+        }
+      }
+    }
+  
+    #present in only all graph
+        else{
+          union_edge_weights[[i]] = E(all_graph)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                            == do.call(paste0, as.data.frame(as_edgelist(all_graph))))]
+          union_edge_colors[[i]] = "red"
+        }
+  }
+  #present in only one or more low impact graph
+  else {
+    
+    if (paste0(union_edges[i,1],union_edges[i,2]) %in% do.call(paste0, as.data.frame(as_edgelist(low_graph_24))) ){
+      if (paste0(union_edges[i,1],union_edges[i,2]) %in% do.call(paste0, as.data.frame(as_edgelist(low_graph_48))) ){
+        if (paste0(union_edges[i,1],union_edges[i,2]) %in% do.call(paste0, as.data.frame(as_edgelist(low_graph_72))) ){
+          #present in all three
+          union_edge_weights[[i]] = maxabs(c(E(low_graph_24)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                            == do.call(paste0, as.data.frame(as_edgelist(low_graph_24))))],
+                                           E(low_graph_48)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                            == do.call(paste0, as.data.frame(as_edgelist(low_graph_48))))],
+                                           E(low_graph_72)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                            == do.call(paste0, as.data.frame(as_edgelist(low_graph_72))))]))
+          union_edge_colors[[i]] = "#c4c3c3"
+        }
+        else{
+          
+          union_edge_weights[[i]] = maxabs(c(E(low_graph_24)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                            == do.call(paste0, as.data.frame(as_edgelist(low_graph_24))))],
+                                           E(low_graph_48)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                            == do.call(paste0, as.data.frame(as_edgelist(low_graph_48))))]))
+
+          union_edge_colors[[i]] = "#cdcdcd"
+        
+        }
+        
+      }
+      else{
+        
+          union_edge_weights[[i]] = E(low_graph_24)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                            == do.call(paste0, as.data.frame(as_edgelist(low_graph_24))))]
+                                           
+          union_edge_colors[[i]] = "#dadada"
+        
+      }
+    
+    }
+    else if (paste0(union_edges[i,1],union_edges[i,2]) %in% do.call(paste0, as.data.frame(as_edgelist(low_graph_48))) ){
+      if (paste0(union_edges[i,1],union_edges[i,2]) %in% do.call(paste0, as.data.frame(as_edgelist(low_graph_72))) ){
+          
+          union_edge_weights[[i]] = maxabs(
+                                           c(E(low_graph_48)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                            == do.call(paste0, as.data.frame(as_edgelist(low_graph_48))))],
+                                           E(low_graph_72)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                            == do.call(paste0, as.data.frame(as_edgelist(low_graph_72))))]))
+
+          union_edge_colors[[i]] = "#b4b4b4"
+      }
+      else{
+        union_edge_weights[[i]] = E(low_graph_48)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                            == do.call(paste0, as.data.frame(as_edgelist(low_graph_48))))]
+
+        union_edge_colors[[i]] = "#c0c0c0"
+      }
+    }
+    else{
+      union_edge_weights[[i]] = E(low_graph_72)$weight[which(paste0(union_edges[i,1],union_edges[i,2])
+                                                            == do.call(paste0, as.data.frame(as_edgelist(low_graph_72))))]
+
+      union_edge_colors[[i]] = "#a7a7a7"
+    }
+    
+  }
+  
+}
+union_edge_lty = if_else(union_edge_weights>0, "solid", "dotted")
+vertex_phyla = case_when(V(union_graph)$name == "Actinomycetales" |
+                         V(union_graph)$name == "Bifidobacteriales" |
+                         V(union_graph)$name == "Coriobacteriales"|
+                           V(union_graph)$name == "Micrococcales"~ "Actionobacteriota",
+                         V(union_graph)$name == "Bacteroidales" ~ "Bacteroidota",
+                         V(union_graph)$name == "Desulfovibrionales" ~ "Desulfobacterota",
+                         V(union_graph)$name == "Verrocomicrobiales" ~ "Verrucomicrobiota",
+                         V(union_graph)$name == "Rhodospirillales" |
+                          V(union_graph)$name == "Pseudomonodales"  ~ "Proteobacteria",
+                         TRUE ~ "Firmicutes")
+vertex_color = case_when(vertex_phyla == "Actionobacteriota" ~ "blue",
+                         vertex_phyla == "Bacteroidota" ~ "orange",
+                         vertex_phyla == "Desulfobacterota" ~ "cyan",
+                         vertex_phyla == "Firmicutes" ~ "purple",
+                         vertex_phyla == "Proteobacteria" ~ "green",
+                         TRUE ~ "brown")
+
+#union_coords = layout.reingold.tilford(union_graph, circular=T)
+
+union_coords = layout.fruchterman.reingold(union_graph)
+
+
+tiff(filename = "../microbe_graph.tiff", width =10, height =8,
+         units = "in", res =300)
+plot(union_graph, layout = union_coords, edge.width = exp(abs(unlist(union_edge_weights))*2),
+     edge.color = unlist(union_edge_colors), edge.lty = unlist(union_edge_lty),
+     vertex.label.dist = case_when(
+           union_coords[,1] <0 ~ -2,
+           union_coords[,1] >0 ~ 2,
+           TRUE ~ 1),
+     vertex.color = vertex_color,
+     vertex.label.degree = case_when(union_coords[,2]<0 & union_coords[,1]<0  ~ -pi/4,
+           union_coords[,2] > 0 & union_coords[,1] > 0 ~ -pi/4,
+           TRUE ~ pi/4 + 0.1))
+
+legend(x= -1.75, y=-0.5, legend = c("Low and High Impact Days", "Only High Impact Days",
+                                 "Low Impact: 0-24 hrs","Low Impact: 0-48 hrs", "Low Impact: 0-72 hrs",
+                                "Low Impact: 24-48 hrs","Low Impact: 24-72 hrs", "Low Impact: 48-72 hrs"),
+           col = c("pink", "red","#dadada","#cdcdcd","#c4c3c3","#c0c0c0","#b4b4b4","#a7a7a7"),
+       lty  =1,cex =1,lwd=2.5,
+           title = "Microbe-Microbe Association", plot = T)
+
+legend(x= -1.75, y=0, legend = c("Positive", "Negative"),
+           col = "black",
+       lty  =c("solid", "dotted"),cex =1,lwd=2.5,
+           title = "Correlation Score", plot = T)
+
+legend(x= 1.1, y=-0.5, legend = c("Actionobacteriota","Bacteroidota","Desulfobacterota",
+                                  "Firmicutes","Proteobacteria"),
+           col = c("blue","orange","cyan","purple","green"),
+       pch  =19,cex =1,
+           title = "Phyla", plot = T)
+
+dev.off()
+
+```
+
+Mediation Analysis
+```{r}
+library(lmerTest)
+func_processed = read.csv("../func_processed.tsv", sep = "\t")
+func_master_no_9 = merge(func_processed, diversity_master_imputed_no_9, by = "Sample_ID")
+func_master_no_9$Prevotella = genus_master_no_9$Prevotella
+lm.M = lmerTest::lmer(xylanolysis ~ Impact.load.sustained.48.72.hours.priot*Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average.+Alcohol+relevel(Bristol.Stool.Scale, ref = 4)+
+             Caffeine + Change.of.Living.or.DIning.Circumstance +
+             Diet.Sodas + Hours.of.Sleep + NSAIDS+Nicotine.Products + 
+             Orthopedic.Injury+ Pre.Workout + Self.Reported.Illness + 
+             Sleep.Quality + Stress.Rating + Symptom.Score + Vomited+Total.Player.Load..Team.Average.for.8.and.16....effort.metric+
+             (1|Player), data = func_master_no_9)
+summary(lm.M)
+
+lm.M = lme4::lmer(xylanolysis ~ Impact.load.sustained.48.72.hours.priot+Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average.+
+                    Impact.load.sustained.48.72.hours.priot:Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average.+
+             (1|Player), data = func_master_no_9)
+summary(lm.M)
+lm.Y = lmer(chemoheterotrophy ~Impact.load.sustained.48.72.hours.priot+
+             (1|Player), data = func_master_no_9)
+summary(lm.Y)
+
+lm.M = lmer(xylanolysis ~Prevotella+
+             (1|Player), data = func_master_no_9)
+summary(lm.M)
+
+lm.BC = lmer(BC_Dissimilarity ~Impact.load.sustained.48.72.hours.priot+Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average.+
+                      Impact.load.sustained.48.72.hours.priot:Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average.+
+             (1|Player), data = func_master_no_9)
+summary(lm.BC)
+
+lm.M.X = lmer(xylanolysis ~Impact.load.sustained.48.72.hours.priot*Hour.of.Fecal.Sample..replaced.missing.values.with.participants.average.+Alcohol+relevel(Bristol.Stool.Scale, ref = 4)+
+             Caffeine + Change.of.Living.or.DIning.Circumstance +
+             Diet.Sodas + Hours.of.Sleep + NSAIDS+Nicotine.Products + 
+             Orthopedic.Injury+ Pre.Workout + Self.Reported.Illness + 
+             Sleep.Quality + Stress.Rating + Symptom.Score + Vomited+Total.Player.Load..Team.Average.for.8.and.16....effort.metric+ BC_Dissimilarity+
+             (1|Player), data = func_master_no_9)
+summary(lm.M.X)
+
+
+
+
+
+```
+
+
+```
+
